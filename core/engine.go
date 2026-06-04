@@ -44,6 +44,14 @@ const (
 	slowAgentFirstEvent = 15 * time.Second // time from send to first agent event
 )
 
+// idleAgentCloseDuration is how long an interactive session's claude process may
+// sit idle (no new user message) before the background sweep closes it to free
+// memory (~200MB each). The cc-connect Session and its claude session id are
+// KEPT, so the next message resumes the conversation via `claude --resume` with
+// full context — only the warm process is released, never the conversation.
+// (reset_on_idle_mins, by contrast, rotates to a fresh session and loses context.)
+const idleAgentCloseDuration = 30 * time.Minute
+
 const (
 	replyFooterUsageTimeout  = 1500 * time.Millisecond
 	replyFooterUsageCacheTTL = 30 * time.Second
@@ -495,6 +503,89 @@ func (e *Engine) runIdleReaper() {
 		case <-ticker.C:
 			e.reapIdleWorkspaces()
 		}
+	}
+}
+
+// runAgentIdleSweep periodically closes idle warm claude processes to free
+// memory (keeping the session for --resume). Started unconditionally from
+// Start() — unlike runIdleReaper, which only runs in multi-workspace mode.
+func (e *Engine) runAgentIdleSweep() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			e.reapIdleAgentSessions()
+		}
+	}
+}
+
+// reapIdleAgentSessions closes claude processes for interactive sessions idle
+// longer than idleAgentCloseDuration, freeing memory without losing context.
+// cleanupInteractiveState releases the process + interactive state but KEEPS the
+// cc-connect Session, so the next message resumes via `claude --resume`. Runs
+// proactively (every minute) — unlike reset_on_idle_mins, which only fires on
+// the next message and also rotates the session (losing context).
+//
+// Safety: snapshot under the lock, then do all per-session checks and the close
+// OUTSIDE the lock (no nested lock acquisition → no lock-ordering deadlock). A
+// turn in progress holds the session lock, so TryLock skips busy sessions; any
+// per-session lookup that can't resolve simply skips (fail-safe: under-reap,
+// never wrong-reap). cleanupInteractiveState's expected-guard skips a session
+// whose state was replaced by a new turn between snapshot and close.
+func (e *Engine) reapIdleAgentSessions() {
+	now := time.Now()
+
+	type cand struct {
+		key   string
+		state *interactiveState
+		as    AgentSession
+	}
+	var cands []cand
+	e.interactiveMu.Lock()
+	for key, state := range e.interactiveStates {
+		if state == nil {
+			continue
+		}
+		state.mu.Lock()
+		as := state.agentSession
+		state.mu.Unlock()
+		if as == nil {
+			continue
+		}
+		cands = append(cands, cand{key: key, state: state, as: as})
+	}
+	e.interactiveMu.Unlock()
+
+	for _, c := range cands {
+		if !c.as.Alive() {
+			continue // process already gone — nothing to free
+		}
+		id := e.sessions.ActiveSessionID(c.key)
+		if id == "" {
+			continue
+		}
+		sess := e.sessions.FindByID(id)
+		if sess == nil {
+			continue
+		}
+		last := sess.GetLastUserActivity()
+		if last.IsZero() {
+			last = sess.GetUpdatedAt()
+		}
+		if last.IsZero() || now.Sub(last) < idleAgentCloseDuration {
+			continue // still recently active
+		}
+		if !sess.TryLock() {
+			continue // a turn is in progress — don't touch it
+		}
+		sess.UnlockWithoutUpdate()
+
+		slog.Info("idle agent sweep: closing idle session process (session kept for --resume)",
+			"session_key", c.key, "idle", now.Sub(last).Round(time.Second))
+		e.cleanupInteractiveState(c.key, c.state)
 	}
 }
 
@@ -1581,6 +1672,9 @@ func (e *Engine) Start() error {
 	} else {
 		slog.Info("engine started", "project", e.name, "agent", e.agent.Name(), "platforms", len(e.platforms))
 	}
+
+	// Free idle warm claude processes (~200MB each) without losing context.
+	go e.runAgentIdleSweep()
 
 	// Only return error if ALL platforms failed
 	if len(startErrs) == len(e.platforms) && len(e.platforms) > 0 {
@@ -2978,7 +3072,10 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	startSessionID := session.GetAgentSessionID()
 	isResume := startSessionID != ""
 	startAt := time.Now()
-	agentSession, err := agent.StartSession(e.ctx, startSessionID)
+	// Carry the session key so worktree-per-session agents can route work_dir
+	// per chat topic (no-op for agents that ignore it).
+	sctx := WithSessionKey(e.ctx, sessionKey)
+	agentSession, err := agent.StartSession(sctx, startSessionID)
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		// If resume/continue failed, try a fresh session as fallback.
@@ -2991,7 +3088,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 			session.SetAgentSessionID("", agent.Name())
 			sessions.Save()
 			startAt = time.Now()
-			agentSession, err = agent.StartSession(e.ctx, "")
+			agentSession, err = agent.StartSession(sctx, "")
 			startElapsed = time.Since(startAt)
 			if err == nil {
 				slog.Info("fresh session started after resume failure",

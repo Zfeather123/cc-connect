@@ -278,6 +278,10 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	if domain != lark.FeishuBaseUrl {
 		clientOpts = append(clientOpts, lark.WithOpenBaseUrl(domain))
 	}
+	// WSL2 NAT silently drops idle keep-alive connections; Go's default pool
+	// reuses a dead one and hangs (e.g. GetChatMembers -> "context deadline
+	// exceeded"). Force a fresh connection per request, like curl.
+	clientOpts = append(clientOpts, lark.WithHttpClient(newNoKeepAliveHTTPClient()))
 
 	base := &Platform{
 		platformName:               name,
@@ -1485,43 +1489,71 @@ type chatMemberEntry struct {
 }
 
 // fetchChatMembers retrieves all members of a chat and returns a name->openID map.
+//
+// NOTE: the lark SDK's GetChatMembers iterator hangs in some environments
+// (observed in WSL2: iter.Next() blocks ~9s until the context deadline while a
+// raw HTTP GET to the exact same endpoint returns in ~1.5s). We therefore bypass
+// the SDK iterator and call the REST endpoint directly via net/http.
 func (p *Platform) fetchChatMembers(ctx context.Context, chatID string) (map[string]string, error) {
-	if p.client == nil {
-		return nil, fmt.Errorf("%s: client not initialized", p.tag())
-	}
 	members := make(map[string]string)
-	req := larkim.NewGetChatMembersReqBuilder().
-		ChatId(chatID).
-		MemberIdType("open_id").
-		PageSize(100).
-		Build()
-	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	token, err := p.fetchFreshTenantAccessToken(timeoutCtx)
 	if err != nil {
 		return nil, fmt.Errorf("%s: fetch tenant token for chat members: %w", p.tag(), err)
 	}
-	iter, err := p.client.Im.ChatMembers.GetByIterator(timeoutCtx, req, larkcore.WithTenantAccessToken(token))
-	if err != nil {
-		return nil, fmt.Errorf("%s: list chat members: %w", p.tag(), err)
+	base := p.domain
+	if base == "" {
+		base = lark.FeishuBaseUrl
 	}
+	httpClient := newNoKeepAliveHTTPClient()
+	pageToken := ""
 	for {
-		hasMore, member, err := iter.Next()
+		u := fmt.Sprintf("%s/open-apis/im/v1/chats/%s/members?member_id_type=open_id&page_size=100&page_token=%s",
+			strings.TrimRight(base, "/"), url.PathEscape(chatID), url.QueryEscape(pageToken))
+		req, err := http.NewRequestWithContext(timeoutCtx, http.MethodGet, u, nil)
 		if err != nil {
-			slog.Debug(p.tag()+": fetch chat members page error", "chat_id", chatID, "error", err)
-			break
+			return nil, fmt.Errorf("%s: build chat members request: %w", p.tag(), err)
 		}
-		if member != nil && member.Name != nil && member.MemberId != nil {
-			name := *member.Name
-			if _, exists := members[name]; !exists {
-				members[name] = *member.MemberId
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("%s: list chat members: %w", p.tag(), err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		var parsed struct {
+			Code int    `json:"code"`
+			Msg  string `json:"msg"`
+			Data struct {
+				Items []struct {
+					MemberID string `json:"member_id"`
+					Name     string `json:"name"`
+				} `json:"items"`
+				PageToken string `json:"page_token"`
+				HasMore   bool   `json:"has_more"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return nil, fmt.Errorf("%s: parse chat members: %w", p.tag(), err)
+		}
+		if parsed.Code != 0 {
+			return nil, fmt.Errorf("%s: list chat members code=%d msg=%s", p.tag(), parsed.Code, parsed.Msg)
+		}
+		for _, it := range parsed.Data.Items {
+			if it.Name == "" || it.MemberID == "" {
+				continue
+			}
+			if _, exists := members[it.Name]; !exists {
+				members[it.Name] = it.MemberID
 			} else {
-				members[name] = ""
+				members[it.Name] = "" // duplicate display name -> ambiguous, skip
 			}
 		}
-		if !hasMore {
+		if !parsed.Data.HasMore || parsed.Data.PageToken == "" {
 			break
 		}
+		pageToken = parsed.Data.PageToken
 	}
 	return members, nil
 }
@@ -1547,6 +1579,14 @@ func (p *Platform) getChatMembers(ctx context.Context, chatID string) map[string
 // (before JSON serialization). Reverse-matches against the chat member list,
 // longest name first. Uses the correct at syntax based on predicted message type.
 func (p *Platform) resolveMentionsInContent(ctx context.Context, chatID, content string) string {
+	return p.resolveMentionsInContentFmt(ctx, chatID, content, predictMsgType(content) == larkim.MsgTypeInteractive)
+}
+
+// resolveMentionsInContentFmt is like resolveMentionsInContent but lets the
+// caller force the card at-syntax. The streaming card-update path
+// (UpdateMessage / UpdateMessageWithStatusFooter) always renders a card, so it
+// must pass useCardFormat=true regardless of predictMsgType.
+func (p *Platform) resolveMentionsInContentFmt(ctx context.Context, chatID, content string, useCardFormat bool) string {
 	if !p.resolveMentions || chatID == "" || !strings.Contains(content, "@") {
 		return content
 	}
@@ -1561,7 +1601,6 @@ func (p *Platform) resolveMentionsInContent(ctx context.Context, chatID, content
 	}
 	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
 
-	useCardFormat := predictMsgType(content) == larkim.MsgTypeInteractive
 	result := content
 	for _, name := range names {
 		pattern := "@" + name
@@ -2975,7 +3014,9 @@ func isBotMentioned(mentions []*larkim.MentionEvent, botOpenID string) bool {
 // already-engaged thread without an explicit @bot mention.
 func isAttachmentMsgType(msgType string) bool {
 	switch msgType {
-	case "image", "file", "audio", "media":
+	case "image", "file", "audio", "media", "merge_forward":
+		// merge_forward 也算"附件类":用户主动合并转发进活跃话题的一捆内容
+		// (文字+多文件)无法 @ 机器人,放行后由 parseMergeForward 合成一轮。
 		return true
 	}
 	return false
@@ -3171,10 +3212,26 @@ func (p *Platform) replayAPIClient() *lark.Client {
 func newFeishuReplayClient(appID, appSecret, domain string) *lark.Client {
 	var opts []lark.ClientOptionFunc
 	opts = append(opts, lark.WithEnableTokenCache(false))
+	opts = append(opts, lark.WithHttpClient(newNoKeepAliveHTTPClient()))
 	if domain != "" && domain != lark.FeishuBaseUrl {
 		opts = append(opts, lark.WithOpenBaseUrl(domain))
 	}
 	return lark.NewClient(appID, appSecret, opts...)
+}
+
+// newNoKeepAliveHTTPClient returns an HTTP client that disables connection reuse.
+// In WSL2 the NAT layer silently drops idle TCP connections; Go's default
+// transport keeps them pooled and may reuse a dead one, hanging the request
+// until its context deadline (observed as GetChatMembers "context deadline
+// exceeded" while curl, which opens a fresh connection each time, succeeds in
+// ~0.3s). Proxy settings are still honored for cross-GFW endpoints.
+func newNoKeepAliveHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:             http.ProxyFromEnvironment,
+			DisableKeepAlives: true,
+		},
+	}
 }
 
 func isTenantAccessTokenInvalid(err error) bool {
@@ -4103,9 +4160,12 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 	} else if payload, ok := core.ParseProgressCardPayload(content); ok {
 		cardJSON = buildProgressCardJSONFromPayload(payload)
 	} else {
-		processed := content
-		if containsMarkdown(content) {
-			processed = preprocessFeishuMarkdown(content)
+		// Resolve @name -> Feishu at tag on the streaming card-update path too
+		// (forced card syntax). Without this, mentions in agent replies that
+		// stream via cards never become real @notifications.
+		processed := p.resolveMentionsInContentFmt(ctx, h.chatID, content, true)
+		if containsMarkdown(processed) {
+			processed = preprocessFeishuMarkdown(processed)
 		}
 		cardJSON = buildCardJSON(sanitizeMarkdownURLs(processed))
 	}
@@ -4136,10 +4196,9 @@ func (p *Platform) UpdateMessageWithStatusFooter(ctx context.Context, previewHan
 	if !ok {
 		return fmt.Errorf("%s: invalid preview handle type %T", p.tag(), previewHandle)
 	}
-	// Mirror UpdateMessage's existing behavior: it does not resolve
-	// @mentions on the card-edit path either. SendWithStatusFooter does
-	// resolve since the matching Send path resolves on the chat-thread API.
-	processedBody := sanitizeMarkdownURLs(preprocessFeishuMarkdown(content))
+	// Resolve @name -> Feishu at tag (forced card syntax) so mentions in
+	// streamed agent replies become real @notifications.
+	processedBody := sanitizeMarkdownURLs(preprocessFeishuMarkdown(p.resolveMentionsInContentFmt(ctx, h.chatID, content, true)))
 	processedFooter := sanitizeMarkdownURLs(preprocessFeishuMarkdown(footer))
 	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
 	// Same card-entity routing as UpdateMessage above.
