@@ -3390,6 +3390,48 @@ type feishuPreviewHandle struct {
 	sequence    int    // cardkit-v1 streaming text monotonic counter (++ before use; first call = 1)
 	status      core.CardStatus
 	lastContent string
+	notified    map[string]bool // open_ids already push-notified this turn (dedup)
+}
+
+// cardAtIDPattern matches the card-format mention tag <at id=ou_xxx> emitted by
+// resolveMentionsInContentFmt(useCardFormat=true).
+var cardAtIDPattern = regexp.MustCompile(`<at id=([a-zA-Z0-9_]+)>`)
+
+// notifyCardMentions push-notifies users @-mentioned in a card. Feishu's card
+// <at> tags render but do NOT push a notification; only a plain-text/post @ does.
+// So when a rich-card reply mentions someone, send a tiny group-level text @ once
+// per person (dedup via h.notified) so they actually get pinged.
+func (p *Platform) notifyCardMentions(ctx context.Context, h *feishuPreviewHandle, cardContent string) {
+	ms := cardAtIDPattern.FindAllStringSubmatch(cardContent, -1)
+	if len(ms) == 0 {
+		return
+	}
+	h.mu.Lock()
+	if h.notified == nil {
+		h.notified = map[string]bool{}
+	}
+	chatID := h.chatID
+	var fresh []string
+	for _, m := range ms {
+		id := m[1]
+		if id != "" && !h.notified[id] {
+			h.notified[id] = true
+			fresh = append(fresh, id)
+		}
+	}
+	h.mu.Unlock()
+	if len(fresh) == 0 || chatID == "" {
+		return
+	}
+	var b strings.Builder
+	for _, id := range fresh {
+		b.WriteString(fmt.Sprintf(`<at user_id="%s"></at>`, id))
+	}
+	b.WriteString(" 话题里有事找你 👆")
+	textJSON, _ := json.Marshal(map[string]string{"text": b.String()})
+	if err := p.createMessage(ctx, chatID, larkim.MsgTypeText, string(textJSON), "mention-notify"); err != nil {
+		slog.Debug(p.tag()+": mention notify failed", "error", err)
+	}
 }
 
 // buildCardJSON builds a Feishu interactive card JSON string with a markdown element.
@@ -3954,6 +3996,9 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	var sendContent string // what goes into the Im.Message.Create / Reply content field
 	var cardID string      // cardkit-v1 entity id (empty = no streaming text path)
 	if isCardJSON(content) {
+		// Resolve @name -> Feishu at-tag in the pre-built rich card JSON
+		// (card format <at id=...></at> is JSON-safe) so mentions notify.
+		content = p.resolveMentionsInContentFmt(ctx, chatID, content, true)
 		cardJSON = content
 		// Try cardkit-v1 two-step flow regardless of Reply vs Create. Both
 		// Im.Message.Reply and Im.Message.Create accept the {type:card,data:{card_id}}
@@ -4152,11 +4197,17 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 
 	cardJSON := ""
 	if isCardJSON(content) {
-		// Card 2.0: engine passes full card JSON directly, skip all processing.
+		// Card 2.0: engine passes full card JSON. Still resolve @name -> Feishu
+		// at-tag (card format <at id=...></at> is JSON-safe) — otherwise mentions
+		// in rich-card replies never become real @notifications.
+		content = p.resolveMentionsInContentFmt(ctx, h.chatID, content, true)
 		cardJSON = content
 		h.mu.Lock()
 		h.lastContent = content
 		h.mu.Unlock()
+		// Card <at> tags don't push notifications — fire a one-shot text @ so the
+		// mentioned person actually gets pinged.
+		p.notifyCardMentions(ctx, h, content)
 	} else if payload, ok := core.ParseProgressCardPayload(content); ok {
 		cardJSON = buildProgressCardJSONFromPayload(payload)
 	} else {
