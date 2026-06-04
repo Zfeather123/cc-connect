@@ -43,6 +43,10 @@ type claudeSession struct {
 	done            chan struct{}
 	alive           atomic.Bool
 
+	// toolNames maps a tool_use id → tool name, so a later tool_result (which
+	// only carries tool_use_id) can be labeled with the tool it came from.
+	toolNames sync.Map
+
 	// activeModel stores the model id reported by the CLI's init event (e.g.
 	// "claude-opus-4-7[1m]"). It may be empty if the init event hasn't
 	// carried a model field yet; callers should fall back to the Agent's
@@ -446,6 +450,9 @@ func (cs *claudeSession) handleAssistant(raw map[string]any) {
 			if toolName == "AskUserQuestion" {
 				continue
 			}
+			if id, _ := item["id"].(string); id != "" {
+				cs.toolNames.Store(id, toolName)
+			}
 			inputSummary := summarizeInput(toolName, item["input"])
 			evt := core.Event{Type: core.EventToolUse, ToolName: toolName, ToolInput: inputSummary}
 			select {
@@ -492,11 +499,56 @@ func (cs *claudeSession) handleUser(raw map[string]any) {
 		contentType, _ := item["type"].(string)
 		if contentType == "tool_result" {
 			isError, _ := item["is_error"].(bool)
+			resultText := toolResultText(item["content"])
+			toolName := ""
+			if id, _ := item["tool_use_id"].(string); id != "" {
+				if v, ok := cs.toolNames.LoadAndDelete(id); ok {
+					toolName, _ = v.(string)
+				}
+			}
+			success := !isError
+			evt := core.Event{
+				Type:        core.EventToolResult,
+				ToolName:    toolName,
+				ToolResult:  resultText,
+				Content:     resultText,
+				ToolSuccess: &success,
+			}
+			select {
+			case cs.events <- evt:
+			case <-cs.ctx.Done():
+				return
+			}
 			if isError {
-				result, _ := item["content"].(string)
-				slog.Debug("claudeSession: tool error", "content", result)
+				slog.Debug("claudeSession: tool error", "content", resultText)
 			}
 		}
+	}
+}
+
+// toolResultText extracts displayable text from a tool_result's content, which
+// claude streams as either a plain string or an array of content blocks.
+func toolResultText(v any) string {
+	switch c := v.(type) {
+	case string:
+		return c
+	case []any:
+		var b strings.Builder
+		for _, blk := range c {
+			m, ok := blk.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := m["text"].(string); t != "" {
+				if b.Len() > 0 {
+					b.WriteString("\n")
+				}
+				b.WriteString(t)
+			}
+		}
+		return b.String()
+	default:
+		return ""
 	}
 }
 

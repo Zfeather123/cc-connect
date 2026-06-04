@@ -34,7 +34,9 @@ func init() {
 //   - "auto":              Claude's automatic permission classifier
 //   - "bypassPermissions": auto-approve everything (alias: yolo)
 type Agent struct {
-	workDir          string
+	workDir            string
+	worktreePerSession bool     // route each session key to its own git worktree (opt-in)
+	worktreeCache      sync.Map // slug -> resolved worktree path
 	cliBin           string   // CLI binary name or path (default: "claude")
 	cliExtraArgs     []string // extra args parsed from cli_path (e.g. ["code", "-t", "foo"])
 	configEnv        []string // env vars from [projects.agent.options.env] — persists across SetSessionEnv calls
@@ -211,8 +213,11 @@ func New(opts map[string]any) (core.Agent, error) {
 		}
 	}
 
+	worktreePerSession, _ := opts["worktree_per_session"].(bool)
+
 	return &Agent{
-		workDir:          workDir,
+		workDir:            workDir,
+		worktreePerSession: worktreePerSession,
 		cliBin:           cliBin,
 		cliExtraArgs:     cliExtraArgs,
 		cliArgsFlag:      cliArgsFlag,
@@ -417,6 +422,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	model := a.model
 	effort := a.reasoningEffort
 	workDir := a.workDir
+	wps := a.worktreePerSession
 	mode := a.mode
 	extraEnv := a.runtimeEnvLocked()
 
@@ -440,6 +446,23 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	// (verbose emits non-JSON text to stdout that corrupts the JSON stream).
 	disableVerbose := a.routerURL != ""
 	a.mu.Unlock()
+
+	// Per-session worktree routing (opt-in). Each session key (e.g. a Feishu
+	// chat topic) gets its own git worktree + isolated DB/ports, created on
+	// first use and reused after. Computed from the immutable session key in
+	// ctx, so concurrent topics never race on shared work_dir state.
+	if wps {
+		if key := core.SessionKeyFromContext(ctx); key != "" {
+			if wd, err := a.ensureWorktree(workDir, key); err != nil {
+				slog.Error("claudecode: worktree routing failed, using shared work_dir",
+					"session_key", key, "error", err)
+			} else {
+				workDir = wd
+				// 活动标记:每条消息刷新 mtime,供 worktree reaper 判闲置(超时只清真没人动的)
+				_ = os.WriteFile(filepath.Join(wd, ".cc-last-active"), []byte(time.Now().Format(time.RFC3339)), 0o644)
+			}
+		}
+	}
 
 	return newClaudeSession(ctx, workDir, a.cliBin, a.cliExtraArgs, a.cliArgsFlag, model, effort, sessionID, mode, systemPrompt, tools, disTools, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok)
 }
