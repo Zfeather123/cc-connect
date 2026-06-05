@@ -133,7 +133,11 @@ type Platform struct {
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
-	client           *lark.Client
+	// mentionAliases maps an agent-written display name to an open_id, for people
+	// whose group nickname differs from their account name (the members API only
+	// returns the account name, so "@群昵称" can't be resolved otherwise).
+	mentionAliases map[string]string
+	client         *lark.Client
 	replayClient     *lark.Client
 	replayClientMu   sync.Mutex
 	wsClient         *larkws.Client
@@ -247,6 +251,22 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		}
 	}
 
+	// mention_aliases: "显示名=ou_xxx,别名2=ou_yyy" — extra name->open_id entries
+	// merged into mention resolution, for nicknames the members API can't surface.
+	mentionAliases := map[string]string{}
+	if v, ok := opts["mention_aliases"].(string); ok {
+		for _, pair := range strings.Split(v, ",") {
+			kv := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+			if len(kv) == 2 {
+				name := strings.TrimSpace(kv[0])
+				openID := strings.TrimSpace(kv[1])
+				if name != "" && openID != "" {
+					mentionAliases[name] = openID
+				}
+			}
+		}
+	}
+
 	progressStyle := "legacy"
 	if v, ok := opts["progress_style"].(string); ok {
 		switch strings.ToLower(strings.TrimSpace(v)) {
@@ -300,6 +320,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		shareSessionInChannel:      shareSessionInChannel,
 		threadIsolation:            threadIsolation,
 		resolveMentions:            resolveMentionsOpt,
+		mentionAliases:             mentionAliases,
 		noReplyToTrigger:           noReplyToTrigger,
 		client:                     lark.NewClient(appID, appSecret, clientOpts...),
 		replayClient:               newFeishuReplayClient(appID, appSecret, domain),
@@ -1591,8 +1612,21 @@ func (p *Platform) resolveMentionsInContentFmt(ctx context.Context, chatID, cont
 		return content
 	}
 	members := p.getChatMembers(ctx, chatID)
-	if len(members) == 0 {
+	if len(members) == 0 && len(p.mentionAliases) == 0 {
 		return content
+	}
+	// Overlay config aliases on top of the (cached) member map without mutating
+	// the cache. Aliases win — they exist precisely for names the members API
+	// can't resolve (group nicknames, unnamed accounts).
+	if len(p.mentionAliases) > 0 {
+		merged := make(map[string]string, len(members)+len(p.mentionAliases))
+		for k, v := range members {
+			merged[k] = v
+		}
+		for k, v := range p.mentionAliases {
+			merged[k] = v
+		}
+		members = merged
 	}
 	// Sort names longest-first to avoid partial matches.
 	names := make([]string, 0, len(members))
@@ -5735,10 +5769,18 @@ func richStepDisplayName(step core.ToolStep) string {
 	if step.Kind == core.ToolStepKindThinking {
 		return "Thinking"
 	}
+	if step.Kind == core.ToolStepKindNarration {
+		return ""
+	}
 	return buildToolDisplay(step.Name, step.Summary).Title
 }
 
 func richStepBody(step core.ToolStep) string {
+	// Narration carries raw assistant prose — return it verbatim (no tool-arg
+	// parsing via buildToolDisplay, which is built for tool name+args).
+	if step.Kind == core.ToolStepKindNarration {
+		return strings.TrimSpace(step.Summary)
+	}
 	name := richStepDisplayName(step)
 	summary := buildToolDisplay(step.Name, step.Summary).Detail
 	if summary == "" {
@@ -5816,15 +5858,18 @@ func buildCardJSONWithStatus(content string, status core.CardStatus) string {
 	return string(b)
 }
 
-func splitRichStepsByLane(steps []core.ToolStep) (reasoning []core.ToolStep, tools []core.ToolStep) {
+func splitRichStepsByLane(steps []core.ToolStep) (reasoning []core.ToolStep, tools []core.ToolStep, narration []core.ToolStep) {
 	for _, step := range steps {
-		if step.Kind == core.ToolStepKindThinking {
+		switch step.Kind {
+		case core.ToolStepKindThinking:
 			reasoning = append(reasoning, step)
-			continue
+		case core.ToolStepKindNarration:
+			narration = append(narration, step)
+		default:
+			tools = append(tools, step)
 		}
-		tools = append(tools, step)
 	}
-	return reasoning, tools
+	return reasoning, tools, narration
 }
 
 func richLaneTitle(label string, count int) string {
@@ -5836,7 +5881,7 @@ func richLaneTitle(label string, count int) string {
 
 func richStepRowContent(step core.ToolStep) string {
 	body := richStepBody(step)
-	if step.Kind == core.ToolStepKindThinking {
+	if step.Kind == core.ToolStepKindThinking || step.Kind == core.ToolStepKindNarration {
 		return body
 	}
 	name := richStepDisplayName(step)
@@ -5859,6 +5904,11 @@ func richStepElement(step core.ToolStep) map[string]any {
 	if step.Kind == core.ToolStepKindThinking {
 		text["text_color"] = "grey"
 		elem["icon"] = map[string]any{"tag": "standard_icon", "token": reasoningToolIcon}
+		return elem
+	}
+	if step.Kind == core.ToolStepKindNarration {
+		// Plain assistant prose: no tool icon, dimmed like reasoning.
+		text["text_color"] = "grey"
 		return elem
 	}
 	elem["icon"] = map[string]any{"tag": "standard_icon", "token": buildToolDisplay(step.Name, step.Summary).IconToken}
@@ -5962,13 +6012,23 @@ func buildRichCard(status core.CardStatus, _ string, steps []core.ToolStep, mark
 }
 
 func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) ([]byte, error) {
-	reasoningSteps, toolSteps := splitRichStepsByLane(steps)
-	panelMaps := make([]map[string]any, 0, 2)
+	reasoningSteps, toolSteps, narrationSteps := splitRichStepsByLane(steps)
+	panelMaps := make([]map[string]any, 0, 3)
 	if len(reasoningSteps) > 0 {
 		panelMaps = append(panelMaps, buildRichPanel(
 			richLaneTitle("Reasoning", len(reasoningSteps)),
 			streaming,
 			richPanelElements(reasoningSteps, "Thinking..."),
+		))
+	}
+	// Narration ("过程"): the agent's intermediate analysis emitted before the
+	// final report. Collapsed by default so the report below stays prominent;
+	// expand to read how it got there.
+	if len(narrationSteps) > 0 {
+		panelMaps = append(panelMaps, buildRichPanel(
+			richLaneTitle("过程", len(narrationSteps)),
+			false,
+			richPanelElements(narrationSteps, ""),
 		))
 	}
 	if len(toolSteps) > 0 {
