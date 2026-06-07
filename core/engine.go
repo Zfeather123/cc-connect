@@ -50,7 +50,7 @@ const (
 // KEPT, so the next message resumes the conversation via `claude --resume` with
 // full context — only the warm process is released, never the conversation.
 // (reset_on_idle_mins, by contrast, rotates to a fresh session and loses context.)
-const idleAgentCloseDuration = 30 * time.Minute
+const idleAgentCloseDuration = 2 * time.Hour
 
 const (
 	replyFooterUsageTimeout  = 1500 * time.Millisecond
