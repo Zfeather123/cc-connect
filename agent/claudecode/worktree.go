@@ -2,6 +2,8 @@ package claudecode
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -21,7 +23,13 @@ func sessionSlug(key string) string {
 	s = worktreeSlugRe.ReplaceAllString(s, "_")
 	s = strings.Trim(s, "_")
 	if len(s) > 60 {
-		s = strings.Trim(s[:60], "_")
+		// A plain s[:60] would drop the distinguishing tail: the fixed prefix
+		// (feishu_ + 35-char oc_ chat id + _root_) alone eats ~48 chars, so two
+		// thread keys in the same chat survive only by the head of their root
+		// message id and collide. Keep a readable prefix and append a hash of the
+		// FULL key to restore uniqueness while staying deterministic.
+		sum := sha1.Sum([]byte(key))
+		s = strings.Trim(s[:51], "_") + "_" + hex.EncodeToString(sum[:])[:8]
 	}
 	return s
 }
