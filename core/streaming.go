@@ -59,6 +59,10 @@ type ToolStepKind string
 const (
 	ToolStepKindTool     ToolStepKind = "tool"
 	ToolStepKindThinking ToolStepKind = "thinking"
+	// ToolStepKindNarration carries the agent's intermediate "spoken" analysis
+	// (assistant text emitted before the final report). Rendered in its own
+	// collapsible "过程/Process" panel so the final report stays prominent.
+	ToolStepKindNarration ToolStepKind = "narration"
 )
 
 // ToolStep is one summarized progress row shown in rich progress cards.

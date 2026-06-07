@@ -3937,6 +3937,13 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if !e.display.ToolMessages {
 					break
 				}
+				// Mark a paragraph boundary in the accumulated narration so the
+				// "过程" panel breaks between the agent's pre-tool and post-tool
+				// text instead of running them together into a wall. Only touches
+				// textParts (the narration source); the body uses event.Content.
+				if n := len(textParts); n > 0 && !strings.HasSuffix(textParts[n-1], "\n") {
+					textParts = append(textParts, "\n\n")
+				}
 				toolSteps = append(toolSteps, ToolStep{
 					Kind:    ToolStepKindTool,
 					Name:    event.ToolName,
@@ -4346,6 +4353,29 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 			if fullResponse == "" {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
+			}
+
+			// Rich card: preserve the agent's intermediate analysis (assistant
+			// text emitted BEFORE the final report) in a collapsible "过程" panel
+			// instead of dropping it. With tool progress shown, fullResponse holds
+			// only the last assistant segment (the report); the earlier narration
+			// lives in textParts. Subtract the report off the tail of the
+			// accumulated text to recover just the narration.
+			if hasRichCard && e.display.ToolMessages && len(textParts) > 0 {
+				acc := strings.TrimSpace(strings.Join(textParts, ""))
+				fin := strings.TrimSpace(event.Content)
+				narration := ""
+				switch {
+				case fin == "" || acc == fin:
+					narration = "" // single segment (or no report) — nothing to split off
+				case strings.HasSuffix(acc, fin):
+					narration = strings.TrimSpace(strings.TrimSuffix(acc, fin))
+				default:
+					narration = acc // can't cleanly subtract; surface the full trail
+				}
+				if narration != "" {
+					toolSteps = append(toolSteps, ToolStep{Kind: ToolStepKindNarration, Summary: narration})
+				}
 			}
 
 			// Strip any agent-self-reported "[ctx: ~XX%]" marker so it does not
